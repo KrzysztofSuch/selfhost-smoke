@@ -1,0 +1,83 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/krzysztofsuch/selfhost-smoke:${{ github.sha }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --build-arg APP_VERSION=${{ github.sha }} -t "$IMAGE" .
+      - name: Test readiness against real services
+        run: |
+          docker run -d --name app --network host \
+            -e ASPNETCORE_URLS=http://+:18080 \
+            -e 'ConnectionStrings__Postgres=Host=127.0.0.1;Username=postgres;Password=test' \
+            -e 'ConnectionStrings__Redis=127.0.0.1:6379' \
+            "$IMAGE"
+          curl -fsS --retry 15 --retry-delay 2 --retry-all-errors http://127.0.0.1:18080/health/ready
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image
+        run: docker push "$IMAGE"
+
+  deploy:
+    needs: build
+    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+      - name: Point Dokploy at the new image and deploy
+        env:
+          URL: ${{ secrets.DOKPLOY_URL }}
+          KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          APP: ${{ secrets.DOKPLOY_APPLICATION_ID }}
+        run: |
+          curl -fsS --retry 5 --retry-all-errors -X POST "$URL/api/application.saveDockerProvider" \
+            -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
+            -d "{\"applicationId\":\"$APP\",\"dockerImage\":\"$IMAGE\",\"username\":null,\"password\":null,\"registryUrl\":null}"
+          curl -fsS -X POST "$URL/api/application.deploy" \
+            -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
+            -d "{\"applicationId\":\"$APP\"}"
+      - name: Wait for the new version on the public URL
+        env:
+          PUBLIC_URL: ${{ secrets.PUBLIC_URL }}
+        run: |
+          for attempt in $(seq 1 40); do
+            if curl -fsS "$PUBLIC_URL/" | grep -q "$GITHUB_SHA" && curl -fsS "$PUBLIC_URL/health/ready"; then
+              exit 0
+            fi
+            sleep 6
+          done
+          echo "New version did not become ready" >&2
+          exit 1
