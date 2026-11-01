@@ -28,4 +28,6 @@ app.MapGet("/health/ready", async (NpgsqlDataSource db, IConnectionMultiplexer c
     }
 });
 
+app.MapGet("/hello", () => "Czesc!");
+
 app.Run();
